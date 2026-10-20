@@ -1,0 +1,36 @@
+# Build directories
+build/
+Build/
+cmake-build-*/
+.vscode/
+.idea/
+
+# Generated files
+*.hex
+*.bin
+*.elf
+*.map
+*.o
+*.d
+*.lst
+*.su
+
+# IDE specific
+*.uvproj*
+*.uvopt*
+*.uvgui*
+.settings/
+.cproject
+.project
+*.launch
+
+# Debug files
+*.axf
+*.out
+*.dSYM/
+
+# Temporary files
+*.tmp
+*~
+.DS_Store
+Thumbs.db

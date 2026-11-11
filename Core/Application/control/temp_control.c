@@ -1,10 +1,3 @@
-/**
- ******************************************************************************
- * @file           : temp_control.c
- * @brief          : 温度控制系统主控制模块实现
- ******************************************************************************
- */
-
 #include "temp_control.h"
 #include "robot_config.h"
 #include "pid_controller.h"
@@ -12,153 +5,130 @@
 #include "bsp_pwm.h"
 #include <math.h>
 
-/* PID 控制器实例 */
 static PID_Controller_t pid_controller;
+static TempControlState_t system_state;
+static float target_temperature;
+static float current_temperature;
+static bool control_enabled;
+static bool temperature_valid;
+static bool overheat_latched;
+static uint32_t last_sample_tick;
+static unsigned valid_samples;
 
-/* 系统状态 */
-static TempControlState_t system_state = TEMP_CTRL_IDLE;
-static float target_temperature = TEMP_DEFAULT_TARGET;
-static float current_temperature = 0.0f;
-static bool control_enabled = false;
-
-/* 温度稳定判断阈值 */
-#define TEMP_STABLE_THRESHOLD   0.5f
-
-/**
- * @brief  初始化温度控制系统
- */
-void TempControl_Init(void)
+static void outputs_off(void)
 {
-    // 初始化 PID 控制器
-    PID_Init(&pid_controller, PID_KP, PID_KI, PID_KD);
-    PID_SetOutputLimits(&pid_controller, -100.0f, 100.0f);
-    PID_SetTarget(&pid_controller, target_temperature);
-
-    // 初始化 DS18B20
-    DS18B20_Init();
-
-    // 初始化 PWM
-    BSP_PWM_Init();
-
-    // 初始化时关闭所有输出
-    BSP_PWM_SetDutyCycle(PWM_CH_FAN1, 0);
-    BSP_PWM_SetDutyCycle(PWM_CH_FAN2, 0);
-    BSP_PWM_SetDutyCycle(PWM_CH_HEATER, 0);
+    BSP_PWM_SetDutyCycle(PWM_CH_HEATER, 0U);
+    BSP_PWM_SetDutyCycle(PWM_CH_FAN1, 0U);
+    BSP_PWM_SetDutyCycle(PWM_CH_FAN2, 0U);
 }
 
-/**
- * @brief  设置目标温度
- */
+static void sensor_fault(void)
+{
+    temperature_valid = false;
+    valid_samples = 0U;
+    system_state = TEMP_CTRL_FAULT;
+    PID_Reset(&pid_controller);
+    outputs_off();
+}
+
+void TempControl_Init(void)
+{
+    target_temperature = TEMP_DEFAULT_TARGET;
+    current_temperature = 0.0f;
+    control_enabled = false;
+    temperature_valid = false;
+    overheat_latched = false;
+    valid_samples = 0U;
+    last_sample_tick = HAL_GetTick();
+    system_state = TEMP_CTRL_IDLE;
+    PID_Init(&pid_controller, PID_KP, PID_KI, PID_KD);
+    PID_SetTarget(&pid_controller, target_temperature);
+    BSP_PWM_Init(); /* Clears all compares before enabling PWM. */
+    DS18B20_Init();
+}
+
 void TempControl_SetTarget(float target_temp)
 {
-    // 限制温度范围
+    if (!isfinite(target_temp)) return;
     if (target_temp < TEMP_MIN) target_temp = TEMP_MIN;
     if (target_temp > TEMP_MAX) target_temp = TEMP_MAX;
-
     target_temperature = target_temp;
     PID_SetTarget(&pid_controller, target_temperature);
     PID_Reset(&pid_controller);
+    outputs_off(); /* Never keep the old command while waiting for a sample. */
 }
 
-/**
- * @brief  获取目标温度
- */
-float TempControl_GetTarget(void)
-{
-    return target_temperature;
-}
+float TempControl_GetTarget(void) { return target_temperature; }
+float TempControl_GetCurrent(void) { return current_temperature; }
+bool TempControl_IsTemperatureValid(void) { return temperature_valid; }
+TempControlState_t TempControl_GetState(void) { return system_state; }
 
-/**
- * @brief  获取当前温度
- */
-float TempControl_GetCurrent(void)
-{
-    return current_temperature;
-}
-
-/**
- * @brief  更新温度控制（需要周期性调用）
- */
 void TempControl_Update(void)
 {
-    // 读取当前温度
-    if (DS18B20_IsPresent()) {
-        current_temperature = DS18B20_ReadTemperature();
-    } else {
-        // 传感器错误，停止控制
-        control_enabled = false;
-        system_state = TEMP_CTRL_IDLE;
-        BSP_PWM_SetDutyCycle(PWM_CH_FAN1, 0);
-        BSP_PWM_SetDutyCycle(PWM_CH_FAN2, 0);
-        BSP_PWM_SetDutyCycle(PWM_CH_HEATER, 0);
+    uint32_t now = HAL_GetTick();
+    if (temperature_valid &&
+        (uint32_t)(now - last_sample_tick) >= TEMP_STALE_TIMEOUT_MS) {
+        sensor_fault();
+    }
+    float sample;
+    DS18B20_Status_t status = DS18B20_Poll(&sample);
+    if (status == DS18B20_WAITING) return;
+    if (status != DS18B20_READY || !isfinite(sample)) {
+        sensor_fault();
         return;
     }
 
-    if (!control_enabled) {
+    now = HAL_GetTick();
+    float dt = valid_samples == 0U ? (float)DS18B20_CONVERT_TIME_MS / 1000.0f :
+        (float)(uint32_t)(now - last_sample_tick) / 1000.0f;
+    current_temperature = sample;
+    temperature_valid = true;
+    last_sample_tick = now;
+    if (valid_samples < TEMP_VALID_SAMPLES) ++valid_samples;
+    if (sample >= TEMP_OVERHEAT_C) overheat_latched = true;
+    if (overheat_latched) {
+        system_state = TEMP_CTRL_FAULT;
+        PID_Reset(&pid_controller);
+        outputs_off();
+        return;
+    }
+    if (!control_enabled || valid_samples < TEMP_VALID_SAMPLES) {
         system_state = TEMP_CTRL_IDLE;
+        outputs_off();
         return;
     }
 
-    // 计算 PID 输出
-    float pid_output = PID_Compute(&pid_controller, current_temperature);
-
-    // 根据 PID 输出控制加热片和风扇
-    if (pid_output > 0) {
-        // 需要加热
-        system_state = TEMP_CTRL_HEATING;
-
-        uint8_t heater_duty = (uint8_t)pid_output;
-        BSP_PWM_SetDutyCycle(PWM_CH_HEATER, heater_duty);
-        BSP_PWM_SetDutyCycle(PWM_CH_FAN1, 0);
-        BSP_PWM_SetDutyCycle(PWM_CH_FAN2, 0);
-
-    } else if (pid_output < 0) {
-        // 需要冷却
+    float output = PID_Compute(&pid_controller, sample, dt);
+    float error = target_temperature - sample;
+    if (error > TEMP_CONTROL_BAND_C) {
+        /* Heat hard while well below setpoint; keep gentle air circulation. */
+        uint8_t heat = error > 2.0f ? 100U :
+                       (uint8_t)(output > 0.0f ? output + 0.5f : 0U);
+        BSP_PWM_SetDutyCycle(PWM_CH_FAN1, FAN_CIRCULATION_DUTY);
+        BSP_PWM_SetDutyCycle(PWM_CH_FAN2, FAN_CIRCULATION_DUTY);
+        BSP_PWM_SetDutyCycle(PWM_CH_HEATER, heat);
+        system_state = heat ? TEMP_CTRL_HEATING : TEMP_CTRL_STABLE;
+    } else if (error < -TEMP_CONTROL_BAND_C) {
+        /* Overshoot: heater off first, then command rapid forced cooling. */
+        BSP_PWM_SetDutyCycle(PWM_CH_HEATER, 0U);
+        BSP_PWM_SetDutyCycle(PWM_CH_FAN1, FAN_COOLING_DUTY);
+        BSP_PWM_SetDutyCycle(PWM_CH_FAN2, FAN_COOLING_DUTY);
         system_state = TEMP_CTRL_COOLING;
-
-        uint8_t fan_duty = (uint8_t)(-pid_output);
-        BSP_PWM_SetDutyCycle(PWM_CH_HEATER, 0);
-        BSP_PWM_SetDutyCycle(PWM_CH_FAN1, fan_duty);
-        BSP_PWM_SetDutyCycle(PWM_CH_FAN2, fan_duty);
-
     } else {
-        // 温度稳定
+        /* Narrow hold band: no heater, retain only gentle circulation. */
+        BSP_PWM_SetDutyCycle(PWM_CH_HEATER, 0U);
+        BSP_PWM_SetDutyCycle(PWM_CH_FAN1, FAN_CIRCULATION_DUTY);
+        BSP_PWM_SetDutyCycle(PWM_CH_FAN2, FAN_CIRCULATION_DUTY);
         system_state = TEMP_CTRL_STABLE;
-
-        BSP_PWM_SetDutyCycle(PWM_CH_HEATER, 0);
-        BSP_PWM_SetDutyCycle(PWM_CH_FAN1, 0);
-        BSP_PWM_SetDutyCycle(PWM_CH_FAN2, 0);
-    }
-
-    // 温度稳定判断
-    if (fabsf(current_temperature - target_temperature) < TEMP_STABLE_THRESHOLD) {
-        if (system_state != TEMP_CTRL_STABLE) {
-            system_state = TEMP_CTRL_STABLE;
-        }
     }
 }
 
-/**
- * @brief  获取系统状态
- */
-TempControlState_t TempControl_GetState(void)
-{
-    return system_state;
-}
-
-/**
- * @brief  使能/禁用温度控制
- */
 void TempControl_Enable(bool enable)
 {
-    control_enabled = enable;
-
-    if (!enable) {
-        // 禁用时关闭所有输出
-        BSP_PWM_SetDutyCycle(PWM_CH_FAN1, 0);
-        BSP_PWM_SetDutyCycle(PWM_CH_FAN2, 0);
-        BSP_PWM_SetDutyCycle(PWM_CH_HEATER, 0);
-        system_state = TEMP_CTRL_IDLE;
-        PID_Reset(&pid_controller);
-    }
+    control_enabled = enable && TEMP_CONTROL_ENABLED;
+    if (!enable) overheat_latched = false;
+    valid_samples = 0U;
+    PID_Reset(&pid_controller);
+    outputs_off();
+    system_state = overheat_latched ? TEMP_CTRL_FAULT : TEMP_CTRL_IDLE;
 }

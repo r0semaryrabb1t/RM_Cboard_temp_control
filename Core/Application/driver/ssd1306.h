@@ -28,7 +28,8 @@ typedef enum {
 
 /* 函数声明 */
 bool SSD1306_Init(void);
-void SSD1306_UpdateScreen(void);
+/* I2C 无应答或传输失败时返回 false，不无限等待。 */
+bool SSD1306_UpdateScreen(void);
 void SSD1306_Fill(SSD1306_Color_t color);
 void SSD1306_DrawPixel(uint8_t x, uint8_t y, SSD1306_Color_t color);
 void SSD1306_WriteChar(uint8_t x, uint8_t y, char ch, SSD1306_Color_t color);

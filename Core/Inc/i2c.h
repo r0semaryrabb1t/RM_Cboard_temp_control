@@ -41,6 +41,8 @@ extern I2C_HandleTypeDef hi2c1;
 void MX_I2C1_Init(void);
 
 /* USER CODE BEGIN Prototypes */
+/* Bounded open-drain bus clear; call only with no transfer in progress. */
+HAL_StatusTypeDef I2C1_RecoverBus(void);
 
 /* USER CODE END Prototypes */
 

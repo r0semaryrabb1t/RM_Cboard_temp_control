@@ -13,6 +13,8 @@ set(CMAKE_SIZE arm-none-eabi-size)
 
 # Project settings
 project(stm32_temp_control C ASM)
+option(TEMP_SENSOR_ONLY "Read/display temperature with all PWM outputs held at zero" OFF)
+option(TEMP_OLED_INVERT_TEST "Alternate OLED full black/white frames; keep all PWM outputs off" OFF)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)
@@ -51,10 +53,10 @@ set(PROJECT_SOURCES
 
     # BSP layer
     Core/Application/bsp/bsp_pwm.c
-    Core/Application/bsp/bsp_bluetooth.c
 
     # Driver layer
     Core/Application/driver/ds18b20.c
+    Core/Application/driver/ds18b20_bus.c
     Core/Application/driver/ssd1306.c
 
     # Control layer
@@ -83,6 +85,8 @@ target_include_directories(${PROJECT_NAME} PRIVATE ${PROJECT_INCLUDES})
 
 # Compiler definitions
 target_compile_definitions(${PROJECT_NAME} PRIVATE
+    TEMP_CONTROL_ENABLED=$<NOT:$<BOOL:${TEMP_SENSOR_ONLY}>>
+    TEMP_OLED_INVERT_TEST=$<BOOL:${TEMP_OLED_INVERT_TEST}>
     USE_HAL_DRIVER
     ${MCU_MODEL}
 )

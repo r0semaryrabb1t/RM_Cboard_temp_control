@@ -28,23 +28,31 @@ extern "C" {
 
 // 温度范围限制 (°C)
 #define TEMP_MIN                0.0f
-#define TEMP_MAX                100.0f
+#define TEMP_MAX                40.0f
 #define TEMP_DEFAULT_TARGET     25.0f
 
-// 温度更新周期 (ms)
-#define TEMP_READ_PERIOD_MS     500U
+// 调试默认保护值，须按实际加热装置验证；超温锁定至手动重新使能。
+#define TEMP_OVERHEAT_C         45.0f
+#define TEMP_STALE_TIMEOUT_MS   2500U
+#define TEMP_VALID_SAMPLES      2U
+#ifndef TEMP_CONTROL_ENABLED
+#define TEMP_CONTROL_ENABLED    1
+#endif
 
-// PID 控制参数
-#define PID_KP                  2.0f
-#define PID_KI                  0.5f
-#define PID_KD                  1.0f
-#define PID_OUTPUT_MIN          0.0f
+// 加热方向 PID（输出限制为 0..100%；远低于目标时全功率快速升温）
+#define PID_KP                  18.0f
+#define PID_KI                  0.20f
+#define PID_KD                  0.0f
+#define TEMP_CONTROL_BAND_C     0.30f
+#define FAN_CIRCULATION_DUTY    20U
+#define FAN_COOLING_DUTY        100U
+#define PID_OUTPUT_MIN          -100.0f
 #define PID_OUTPUT_MAX          100.0f
-#define PID_INTEGRAL_LIMIT      50.0f
+#define PID_INTEGRAL_LIMIT      200.0f
 
 /* ==================== 风扇控制参数 ==================== */
 
-// 风扇 PWM 范围 (0-100%)
+// 风扇 PWM 范围 (0-100%)；假设现有驱动输入为低有效
 #define FAN_PWM_MIN             0U
 #define FAN_PWM_MAX             100U
 #define FAN_DUTY_CYCLE_MAX      100U
@@ -79,15 +87,9 @@ extern "C" {
 
 /* ==================== DS18B20 配置 ==================== */
 
-// 单总线延时时序 (us)
-#define DS18B20_RESET_DELAY_US  480U
-#define DS18B20_PRESENCE_DELAY_US 60U
-#define DS18B20_WRITE_1_DELAY_US 10U
-#define DS18B20_WRITE_0_DELAY_US 60U
-#define DS18B20_READ_DELAY_US   15U
-
-// 温度转换时间 (ms)
+// 12-bit 转换最长 750ms；主循环不能同时启动另一条读温流程。
 #define DS18B20_CONVERT_TIME_MS 750U
+#define DS18B20_RETRY_MS        1000U
 
 /* ==================== 调试选项 ==================== */
 

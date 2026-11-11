@@ -1,35 +1,29 @@
-/**
- ******************************************************************************
- * @file           : ds18b20.h
- * @brief          : DS18B20 温度传感器驱动
- ******************************************************************************
- */
+#ifndef DS18B20_H
+#define DS18B20_H
 
-#ifndef __DS18B20_H
-#define __DS18B20_H
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#include "main.h"
-#include <stdint.h>
-#include <stdbool.h>
+typedef enum {
+    DS18B20_WAITING = 0,
+    DS18B20_READY,
+    DS18B20_NO_DEVICE,
+    DS18B20_CRC_ERROR,
+    DS18B20_TIMEOUT,
+    DS18B20_INVALID_DATA
+} DS18B20_Status_t;
 
-/* DS18B20 ROM 命令 */
-#define DS18B20_CMD_SKIP_ROM        0xCC
-#define DS18B20_CMD_CONVERT_T       0x44
-#define DS18B20_CMD_READ_SCRATCHPAD 0xBE
-
-/* 函数声明 */
 void DS18B20_Init(void);
-bool DS18B20_IsPresent(void);
-void DS18B20_StartConversion(void);
-float DS18B20_ReadTemperature(void);
-bool DS18B20_ReadTemperatureNonBlocking(float *temp);
+/* Single owner: call frequently from TempControl_Update only.
+ * READY writes a fresh, validated sample; all other results leave *temp intact.
+ * Uses SKIP ROM: one sensor only, VDD required (no parasite power). */
+DS18B20_Status_t DS18B20_Poll(float *temp);
+DS18B20_Status_t DS18B20_GetStatus(void);
 
 #ifdef __cplusplus
 }
 #endif
-
-#endif /* __DS18B20_H */
+#endif

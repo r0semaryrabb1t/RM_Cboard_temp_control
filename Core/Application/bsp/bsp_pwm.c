@@ -18,7 +18,10 @@ extern TIM_HandleTypeDef htim3;  // 加热片
  */
 void BSP_PWM_Init(void)
 {
-    // CubeMX 已完成定时器初始化，这里启动 PWM 输出
+    /* Clear compares BEFORE starting, including when reinitializing. */
+    BSP_PWM_SetDutyCycle(PWM_CH_HEATER, 0U);
+    BSP_PWM_SetDutyCycle(PWM_CH_FAN1, 0U);
+    BSP_PWM_SetDutyCycle(PWM_CH_FAN2, 0U);
     BSP_PWM_StartAll();
 }
 
@@ -31,19 +34,17 @@ void BSP_PWM_SetDutyCycle(PWM_Channel_t channel, uint8_t duty)
 {
     if (duty > 100) duty = 100;
 
-    uint32_t pulse = (uint32_t)(PWM_PERIOD * duty / 100);
-
     switch (channel) {
         case PWM_CH_FAN1:
-            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pulse);
+            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, (__HAL_TIM_GET_AUTORELOAD(&htim1) + 1U) * duty / 100U);
             break;
 
         case PWM_CH_FAN2:
-            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, pulse);
+            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, (__HAL_TIM_GET_AUTORELOAD(&htim1) + 1U) * duty / 100U);
             break;
 
         case PWM_CH_HEATER:
-            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, pulse);
+            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, (__HAL_TIM_GET_AUTORELOAD(&htim3) + 1U) * duty / 100U);
             break;
 
         default:
@@ -102,9 +103,9 @@ void BSP_PWM_Stop(PWM_Channel_t channel)
  */
 void BSP_PWM_StartAll(void)
 {
-    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);  // 风扇1
-    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);  // 风扇2
-    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);  // 加热片
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);  // PA8 风扇1
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);  // PA9 风扇2
+    /* PB4 heater is armed only after a valid temperature-control command. */
 }
 
 /**

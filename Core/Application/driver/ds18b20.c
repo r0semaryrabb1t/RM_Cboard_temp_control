@@ -1,238 +1,101 @@
-/**
- ******************************************************************************
- * @file           : ds18b20.c
- * @brief          : DS18B20 温度传感器驱动实现
- ******************************************************************************
- */
-
 #include "ds18b20.h"
+#include "ds18b20_bus.h"
+#include "main.h"
 #include "robot_config.h"
-#include "gpio.h"
+#include <stdbool.h>
+#include <stddef.h>
 
-/* DS18B20 DQ 引脚操作宏 */
-#define DS18B20_DQ_PIN      GPIO_PIN_12
-#define DS18B20_DQ_PORT     GPIOA
+#define CMD_SKIP_ROM        0xCCU
+#define CMD_CONVERT_T       0x44U
+#define CMD_READ_SCRATCHPAD  0xBEU
 
-#define DS18B20_DQ_OUT(x)   HAL_GPIO_WritePin(DS18B20_DQ_PORT, DS18B20_DQ_PIN, (x) ? GPIO_PIN_SET : GPIO_PIN_RESET)
-#define DS18B20_DQ_IN()     HAL_GPIO_ReadPin(DS18B20_DQ_PORT, DS18B20_DQ_PIN)
+static enum { START, CONVERTING, RETRY } phase;
+static uint32_t phase_tick;
+static DS18B20_Status_t last_status;
 
-/* 微秒延时（粗略实现，需要根据实际时钟调整） */
-static void delay_us(uint32_t us)
+static uint8_t crc8(const uint8_t *data, unsigned count)
 {
-    uint32_t ticks = us * (SystemCoreClock / 1000000) / 5;
-    while (ticks--);
-}
-
-/* 设置 DQ 引脚为输出模式 */
-static void DS18B20_SetOutputMode(void)
-{
-    GPIO_InitTypeDef GPIO_InitStruct = {0};
-    GPIO_InitStruct.Pin = DS18B20_DQ_PIN;
-    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-    HAL_GPIO_Init(DS18B20_DQ_PORT, &GPIO_InitStruct);
-}
-
-/* 设置 DQ 引脚为输入模式 */
-static void DS18B20_SetInputMode(void)
-{
-    GPIO_InitTypeDef GPIO_InitStruct = {0};
-    GPIO_InitStruct.Pin = DS18B20_DQ_PIN;
-    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-    GPIO_InitStruct.Pull = GPIO_PULLUP;
-    HAL_GPIO_Init(DS18B20_DQ_PORT, &GPIO_InitStruct);
-}
-
-/* 复位 DS18B20 */
-static bool DS18B20_Reset(void)
-{
-    bool present = false;
-
-    DS18B20_SetOutputMode();
-    DS18B20_DQ_OUT(0);
-    delay_us(DS18B20_RESET_DELAY_US);
-
-    DS18B20_DQ_OUT(1);
-    DS18B20_SetInputMode();
-    delay_us(DS18B20_PRESENCE_DELAY_US);
-
-    if (DS18B20_DQ_IN() == GPIO_PIN_RESET) {
-        present = true;
-    }
-
-    delay_us(DS18B20_RESET_DELAY_US - DS18B20_PRESENCE_DELAY_US);
-
-    return present;
-}
-
-/* 写一个位 */
-static void DS18B20_WriteBit(uint8_t bit)
-{
-    DS18B20_SetOutputMode();
-    DS18B20_DQ_OUT(0);
-
-    if (bit) {
-        delay_us(DS18B20_WRITE_1_DELAY_US);
-        DS18B20_DQ_OUT(1);
-        delay_us(DS18B20_WRITE_0_DELAY_US - DS18B20_WRITE_1_DELAY_US);
-    } else {
-        delay_us(DS18B20_WRITE_0_DELAY_US);
-        DS18B20_DQ_OUT(1);
-    }
-
-    delay_us(5);
-}
-
-/* 读一个位 */
-static uint8_t DS18B20_ReadBit(void)
-{
-    uint8_t bit = 0;
-
-    DS18B20_SetOutputMode();
-    DS18B20_DQ_OUT(0);
-    delay_us(2);
-
-    DS18B20_DQ_OUT(1);
-    DS18B20_SetInputMode();
-    delay_us(DS18B20_READ_DELAY_US);
-
-    if (DS18B20_DQ_IN() == GPIO_PIN_SET) {
-        bit = 1;
-    }
-
-    delay_us(DS18B20_WRITE_0_DELAY_US - DS18B20_READ_DELAY_US);
-
-    return bit;
-}
-
-/* 写一个字节 */
-static void DS18B20_WriteByte(uint8_t byte)
-{
-    for (uint8_t i = 0; i < 8; i++) {
-        DS18B20_WriteBit(byte & 0x01);
-        byte >>= 1;
-    }
-}
-
-/* 读一个字节 */
-static uint8_t DS18B20_ReadByte(void)
-{
-    uint8_t byte = 0;
-
-    for (uint8_t i = 0; i < 8; i++) {
-        byte >>= 1;
-        if (DS18B20_ReadBit()) {
-            byte |= 0x80;
+    uint8_t crc = 0U;
+    for (unsigned i = 0; i < count; ++i) {
+        uint8_t value = data[i];
+        for (unsigned bit = 0; bit < 8U; ++bit) {
+            uint8_t mix = (crc ^ value) & 1U;
+            crc >>= 1U;
+            if (mix) crc ^= 0x8CU;
+            value >>= 1U;
         }
     }
-
-    return byte;
+    return crc;
 }
 
-/**
- * @brief  初始化 DS18B20
- */
+static DS18B20_Status_t fail(DS18B20_Status_t status)
+{
+    last_status = status;
+    phase = RETRY;
+    phase_tick = HAL_GetTick();
+    return status;
+}
+
 void DS18B20_Init(void)
 {
-    DS18B20_SetOutputMode();
-    DS18B20_DQ_OUT(1);
+    DS18B20_BusInit();
+    phase = START;
+    phase_tick = 0U;
+    last_status = DS18B20_WAITING;
 }
 
-/**
- * @brief  检测 DS18B20 是否存在
- */
-bool DS18B20_IsPresent(void)
+DS18B20_Status_t DS18B20_GetStatus(void)
 {
-    return DS18B20_Reset();
+    return last_status;
 }
 
-/**
- * @brief  启动温度转换
- */
-void DS18B20_StartConversion(void)
+DS18B20_Status_t DS18B20_Poll(float *temp)
 {
-    DS18B20_Reset();
-    DS18B20_WriteByte(DS18B20_CMD_SKIP_ROM);
-    DS18B20_WriteByte(DS18B20_CMD_CONVERT_T);
-}
-
-/**
- * @brief  读取温度（阻塞式）
- * @return 温度值（摄氏度）
- */
-float DS18B20_ReadTemperature(void)
-{
-    uint8_t temp_lsb, temp_msb;
-    int16_t temp_raw;
-    float temperature;
-
-    // 启动转换
-    DS18B20_StartConversion();
-
-    // 等待转换完成
-    HAL_Delay(DS18B20_CONVERT_TIME_MS);
-
-    // 读取温度数据
-    DS18B20_Reset();
-    DS18B20_WriteByte(DS18B20_CMD_SKIP_ROM);
-    DS18B20_WriteByte(DS18B20_CMD_READ_SCRATCHPAD);
-
-    temp_lsb = DS18B20_ReadByte();
-    temp_msb = DS18B20_ReadByte();
-
-    temp_raw = (int16_t)((temp_msb << 8) | temp_lsb);
-    temperature = (float)temp_raw / 16.0f;
-
-    return temperature;
-}
-
-/**
- * @brief  读取温度（非阻塞式，需要外部状态机配合）
- * @param  temp: 温度输出指针
- * @return true 表示读取成功，false 表示需要等待转换完成
- */
-bool DS18B20_ReadTemperatureNonBlocking(float *temp)
-{
-    static enum {
-        STATE_START_CONVERSION,
-        STATE_WAIT_CONVERSION,
-        STATE_READ_DATA
-    } state = STATE_START_CONVERSION;
-
-    static uint32_t conversion_start_tick = 0;
-
-    switch (state) {
-        case STATE_START_CONVERSION:
-            DS18B20_StartConversion();
-            conversion_start_tick = HAL_GetTick();
-            state = STATE_WAIT_CONVERSION;
-            return false;
-
-        case STATE_WAIT_CONVERSION:
-            if (HAL_GetTick() - conversion_start_tick >= DS18B20_CONVERT_TIME_MS) {
-                state = STATE_READ_DATA;
-            }
-            return false;
-
-        case STATE_READ_DATA: {
-            uint8_t temp_lsb, temp_msb;
-            int16_t temp_raw;
-
-            DS18B20_Reset();
-            DS18B20_WriteByte(DS18B20_CMD_SKIP_ROM);
-            DS18B20_WriteByte(DS18B20_CMD_READ_SCRATCHPAD);
-
-            temp_lsb = DS18B20_ReadByte();
-            temp_msb = DS18B20_ReadByte();
-
-            temp_raw = (int16_t)((temp_msb << 8) | temp_lsb);
-            *temp = (float)temp_raw / 16.0f;
-
-            state = STATE_START_CONVERSION;
-            return true;
-        }
+    if (temp == NULL) return fail(DS18B20_INVALID_DATA);
+    uint32_t now = HAL_GetTick();
+    if (phase == RETRY) {
+        if ((uint32_t)(now - phase_tick) < DS18B20_RETRY_MS)
+            return DS18B20_WAITING;
+        phase = START;
     }
-
-    return false;
+    if (phase == START) {
+        if (!DS18B20_BusReset()) return fail(DS18B20_NO_DEVICE);
+        DS18B20_BusWriteByte(CMD_SKIP_ROM);
+        DS18B20_BusWriteByte(CMD_CONVERT_T);
+        phase_tick = HAL_GetTick();
+        phase = CONVERTING;
+        return DS18B20_WAITING;
+    }
+    uint32_t elapsed = (uint32_t)(now - phase_tick);
+    if (elapsed < DS18B20_CONVERT_TIME_MS) return DS18B20_WAITING;
+    /* Do not feed an old conversion to PID after a long main-loop stall. */
+    if (elapsed >= TEMP_STALE_TIMEOUT_MS || !DS18B20_BusReadBit())
+        return fail(DS18B20_TIMEOUT);
+    if (!DS18B20_BusReset()) return fail(DS18B20_NO_DEVICE);
+    DS18B20_BusWriteByte(CMD_SKIP_ROM);
+    DS18B20_BusWriteByte(CMD_READ_SCRATCHPAD);
+    uint8_t scratchpad[9];
+    bool all_zero = true;
+    for (unsigned i = 0; i < sizeof(scratchpad); ++i) {
+        scratchpad[i] = DS18B20_BusReadByte();
+        if (scratchpad[i] != 0U) all_zero = false;
+    }
+    /* All-zero data has a valid zero CRC but is not a valid scratchpad. */
+    if (all_zero) return fail(DS18B20_INVALID_DATA);
+    if (crc8(scratchpad, 8U) != scratchpad[8])
+        return fail(DS18B20_CRC_ERROR);
+    /* DS18B20 config: bit 7 = 0, bits 4..0 = 1. */
+    if ((scratchpad[4] & 0x9FU) != 0x1FU)
+        return fail(DS18B20_INVALID_DATA);
+    uint16_t raw = ((uint16_t)scratchpad[1] << 8U) | scratchpad[0];
+    unsigned resolution = (scratchpad[4] >> 5U) & 3U;
+    raw &= (uint16_t)(0xFFFFU << (3U - resolution));
+    int32_t signed_raw = (raw & 0x8000U) ? (int32_t)raw - 65536 : raw;
+    float value = (float)signed_raw / 16.0f;
+    if (value < -55.0f || value > 125.0f)
+        return fail(DS18B20_INVALID_DATA);
+    *temp = value;
+    phase = START;
+    last_status = DS18B20_READY;
+    return DS18B20_READY;
 }

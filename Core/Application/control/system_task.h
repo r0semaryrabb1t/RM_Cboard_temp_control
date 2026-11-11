@@ -17,7 +17,6 @@ extern "C" {
 /* 函数声明 */
 void SystemTask_Init(void);
 void SystemTask_Run(void);
-void SystemTask_BluetoothRxCallback(uint8_t *data, uint16_t len);
 
 #ifdef __cplusplus
 }

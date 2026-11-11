@@ -38,7 +38,7 @@ static uint8_t ssd1306_buffer[SSD1306_WIDTH * SSD1306_HEIGHT / 8];
 static uint8_t cursor_x = 0;
 static uint8_t cursor_y = 0;
 
-/* 5x7 ASCII 字体 (字符 32-126) */
+/* 5x7 ASCII 字体 (字符 32-90，小写字母在绘制时转为大写) */
 static const uint8_t Font5x7[][5] = {
     {0x00, 0x00, 0x00, 0x00, 0x00}, // ' '
     {0x00, 0x00, 0x5F, 0x00, 0x00}, // '!'
@@ -101,67 +101,60 @@ static const uint8_t Font5x7[][5] = {
     {0x61, 0x51, 0x49, 0x45, 0x43}, // 'Z'
 };
 
-/* 写命令 */
-static void SSD1306_WriteCommand(uint8_t cmd)
+/* 单次 I2C 操作必须有界；外设断电/接线故障不能卡死主循环。 */
+#define SSD1306_I2C_TIMEOUT_MS 25U
+
+static bool SSD1306_WriteCommand(uint8_t cmd)
 {
-    HAL_I2C_Mem_Write(&hi2c1, OLED_I2C_ADDRESS, 0x00, 1, &cmd, 1, HAL_MAX_DELAY);
+    return HAL_I2C_Mem_Write(&hi2c1, OLED_I2C_ADDRESS, 0x00, 1, &cmd, 1,
+                             SSD1306_I2C_TIMEOUT_MS) == HAL_OK;
 }
 
-/* 写数据 */
-static void SSD1306_WriteData(uint8_t *data, uint16_t len)
+static bool SSD1306_WriteData(uint8_t *data, uint16_t len)
 {
-    HAL_I2C_Mem_Write(&hi2c1, OLED_I2C_ADDRESS, 0x40, 1, data, len, HAL_MAX_DELAY);
+    return HAL_I2C_Mem_Write(&hi2c1, OLED_I2C_ADDRESS, 0x40, 1, data, len,
+                             SSD1306_I2C_TIMEOUT_MS) == HAL_OK;
 }
 
-/**
- * @brief  初始化 SSD1306
- */
 bool SSD1306_Init(void)
 {
-    HAL_Delay(100);  // 等待 OLED 上电稳定
+    static const uint8_t init_commands[] = {
+        SSD1306_CMD_DISPLAY_OFF, SSD1306_CMD_SET_CLOCK_DIV, 0x80,
+        SSD1306_CMD_SET_MULTIPLEX, SSD1306_HEIGHT - 1,
+        SSD1306_CMD_SET_DISPLAY_OFFSET, 0x00,
+        SSD1306_CMD_SET_START_LINE, SSD1306_CMD_CHARGE_PUMP, 0x14,
+        SSD1306_CMD_MEMORY_MODE, 0x00, SSD1306_CMD_SEG_REMAP,
+        SSD1306_CMD_COM_SCAN_DEC, SSD1306_CMD_SET_COM_PINS, 0x12,
+        SSD1306_CMD_SET_CONTRAST, 0xCF, SSD1306_CMD_SET_PRECHARGE, 0xF1,
+        SSD1306_CMD_SET_VCOM_DETECT, 0x40,
+        SSD1306_CMD_NORMAL_DISPLAY, SSD1306_CMD_DISPLAY_ON
+    };
 
-    SSD1306_WriteCommand(SSD1306_CMD_DISPLAY_OFF);
-    SSD1306_WriteCommand(SSD1306_CMD_SET_CLOCK_DIV);
-    SSD1306_WriteCommand(0x80);
-    SSD1306_WriteCommand(SSD1306_CMD_SET_MULTIPLEX);
-    SSD1306_WriteCommand(SSD1306_HEIGHT - 1);
-    SSD1306_WriteCommand(SSD1306_CMD_SET_DISPLAY_OFFSET);
-    SSD1306_WriteCommand(0x00);
-    SSD1306_WriteCommand(SSD1306_CMD_SET_START_LINE | 0x00);
-    SSD1306_WriteCommand(SSD1306_CMD_CHARGE_PUMP);
-    SSD1306_WriteCommand(0x14);
-    SSD1306_WriteCommand(SSD1306_CMD_MEMORY_MODE);
-    SSD1306_WriteCommand(0x00);
-    SSD1306_WriteCommand(SSD1306_CMD_SEG_REMAP);
-    SSD1306_WriteCommand(SSD1306_CMD_COM_SCAN_DEC);
-    SSD1306_WriteCommand(SSD1306_CMD_SET_COM_PINS);
-    SSD1306_WriteCommand(0x12);
-    SSD1306_WriteCommand(SSD1306_CMD_SET_CONTRAST);
-    SSD1306_WriteCommand(0xCF);
-    SSD1306_WriteCommand(SSD1306_CMD_SET_PRECHARGE);
-    SSD1306_WriteCommand(0xF1);
-    SSD1306_WriteCommand(SSD1306_CMD_SET_VCOM_DETECT);
-    SSD1306_WriteCommand(0x40);
-    SSD1306_WriteCommand(SSD1306_CMD_NORMAL_DISPLAY);
-    SSD1306_WriteCommand(SSD1306_CMD_DISPLAY_ON);
-
+    HAL_Delay(100);
+    if (HAL_I2C_IsDeviceReady(&hi2c1, OLED_I2C_ADDRESS, 1U,
+                              SSD1306_I2C_TIMEOUT_MS) != HAL_OK) {
+        return false;
+    }
+    for (uint32_t i = 0; i < sizeof(init_commands); i++) {
+        if (!SSD1306_WriteCommand(init_commands[i])) {
+            return false;
+        }
+    }
     SSD1306_Fill(SSD1306_COLOR_BLACK);
-    SSD1306_UpdateScreen();
-
-    return true;
+    return SSD1306_UpdateScreen();
 }
 
-/**
- * @brief  更新屏幕显示
- */
-void SSD1306_UpdateScreen(void)
+bool SSD1306_UpdateScreen(void)
 {
     for (uint8_t i = 0; i < 8; i++) {
-        SSD1306_WriteCommand(0xB0 + i);  // 设置页地址
-        SSD1306_WriteCommand(0x00);      // 设置列低地址
-        SSD1306_WriteCommand(0x10);      // 设置列高地址
-        SSD1306_WriteData(&ssd1306_buffer[SSD1306_WIDTH * i], SSD1306_WIDTH);
+        if (!SSD1306_WriteCommand(0xB0 + i) ||
+            !SSD1306_WriteCommand(0x00) ||
+            !SSD1306_WriteCommand(0x10) ||
+            !SSD1306_WriteData(&ssd1306_buffer[SSD1306_WIDTH * i], SSD1306_WIDTH)) {
+            return false;
+        }
     }
+    return true;
 }
 
 /**
@@ -191,7 +184,13 @@ void SSD1306_DrawPixel(uint8_t x, uint8_t y, SSD1306_Color_t color)
  */
 void SSD1306_WriteChar(uint8_t x, uint8_t y, char ch, SSD1306_Color_t color)
 {
-    if (ch < 32 || ch > 126) return;
+    /* 当前字库只有 ASCII 32..90，不能按 32..126 索引，否则越界。 */
+    if (ch >= 'a' && ch <= 'z') {
+        ch = (char)(ch - 'a' + 'A');
+    }
+    if (ch < 32 || ch > 90) {
+        ch = '?';
+    }
 
     uint8_t font_index = ch - 32;
 

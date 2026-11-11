@@ -1,137 +1,112 @@
-/**
- ******************************************************************************
- * @file           : system_task.c
- * @brief          : 系统任务调度模块实现
- ******************************************************************************
- */
-
 #include "system_task.h"
 #include "robot_config.h"
 #include "temp_control.h"
-#include "bsp_bluetooth.h"
+#include "ds18b20.h"
 #include "ssd1306.h"
+#include "i2c.h"
+#include "bsp_pwm.h"
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
-/* 任务周期计数器 */
-static uint32_t last_temp_update_tick = 0;
-static uint32_t last_display_update_tick = 0;
+#ifndef TEMP_OLED_INVERT_TEST
+#define TEMP_OLED_INVERT_TEST 0
+#endif
 
-/**
- * @brief  初始化系统任务
- */
+static uint32_t last_display_tick;
+static uint32_t last_oled_retry_tick;
+static bool oled_ready;
+#if TEMP_OLED_INVERT_TEST
+static uint32_t oled_test_tick;
+static bool oled_test_white;
+#endif
+
+/* newlib-nano does not link float printf by default. Format tenths as integers. */
+static void format_temperature(char *buffer, size_t size,
+                               const char *label, float temperature)
+{
+    int tenths = (int)(temperature * 10.0f + (temperature >= 0.0f ? 0.5f : -0.5f));
+    unsigned magnitude = (unsigned)(tenths < 0 ? -tenths : tenths);
+    snprintf(buffer, size, "%s:%s%u.%uC", label, tenths < 0 ? "-" : "",
+             magnitude / 10U, magnitude % 10U);
+}
+
+static void display_temperature(void)
+{
+    char line[22];
+    SSD1306_Fill(SSD1306_COLOR_BLACK);
+    bool temperature_valid = TempControl_IsTemperatureValid();
+    float current_temperature = TempControl_GetCurrent();
+    DS18B20_Status_t sensor_status = DS18B20_GetStatus();
+    if (temperature_valid) {
+        format_temperature(line, sizeof(line), "CURR", current_temperature);
+    } else {
+        const char *error;
+        switch (sensor_status) {
+            case DS18B20_WAITING:      error = "WAIT"; break;
+            case DS18B20_NO_DEVICE:    error = "NO SENSOR"; break;
+            case DS18B20_CRC_ERROR:    error = "CRC ERR"; break;
+            case DS18B20_TIMEOUT:      error = "TIMEOUT"; break;
+            default:                  error = "DATA ERR"; break;
+        }
+        snprintf(line, sizeof(line), "CURR:%s", error);
+    }
+    SSD1306_WriteString(0, 16, line, SSD1306_COLOR_WHITE);
+    format_temperature(line, sizeof(line), "SET", TempControl_GetTarget());
+    SSD1306_WriteString(0, 40, line, SSD1306_COLOR_WHITE);
+    oled_ready = SSD1306_UpdateScreen();
+}
+
+
 void SystemTask_Init(void)
 {
-    // 初始化温度控制
     TempControl_Init();
-
-    // 初始化蓝牙
-    BSP_Bluetooth_Init();
-    BSP_Bluetooth_RegisterRxCallback(SystemTask_BluetoothRxCallback);
-
-    // 初始化 OLED 显示
-    SSD1306_Init();
-    SSD1306_Clear();
-    SSD1306_WriteString(0, 0, "Temp Control", SSD1306_COLOR_WHITE);
-    SSD1306_WriteString(0, 16, "System Ready", SSD1306_COLOR_WHITE);
-    SSD1306_UpdateScreen();
-
-    HAL_Delay(1000);
-
-    // 启动温度控制
-    TempControl_Enable(true);
+#if TEMP_OLED_INVERT_TEST
+    /* Keep heater and both fans off while exercising the OLED panel. */
+    TempControl_Enable(false);
+    BSP_PWM_SetDutyCycle(PWM_CH_HEATER, 0U);
+    BSP_PWM_SetDutyCycle(PWM_CH_FAN1, 0U);
+    BSP_PWM_SetDutyCycle(PWM_CH_FAN2, 0U);
+#else
+    TempControl_Enable(TEMP_CONTROL_ENABLED != 0);
+    /* PID may command the heater later; start its timer only in control mode. */
+    BSP_PWM_Start(PWM_CH_HEATER);
+#endif
+    /* Start first DS18B20 conversion immediately, then keep the display live. */
+    TempControl_Update();
+    oled_ready = SSD1306_Init();
+    if (oled_ready) {
+#if TEMP_OLED_INVERT_TEST
+        SSD1306_Fill(SSD1306_COLOR_BLACK);
+        oled_ready = SSD1306_UpdateScreen();
+#else
+        display_temperature();
+#endif
+    }
+    last_display_tick = last_oled_retry_tick = HAL_GetTick();
+#if TEMP_OLED_INVERT_TEST
+    oled_test_tick = last_display_tick;
+#endif
 }
 
-/**
- * @brief  系统主循环任务
- */
 void SystemTask_Run(void)
 {
-    uint32_t current_tick = HAL_GetTick();
-
-    // 温度控制更新任务
-    if (current_tick - last_temp_update_tick >= TEMP_READ_PERIOD_MS) {
-        last_temp_update_tick = current_tick;
-        TempControl_Update();
+    TempControl_Update();
+    uint32_t now = HAL_GetTick();
+#if TEMP_OLED_INVERT_TEST
+    if (oled_ready && (uint32_t)(now - oled_test_tick) >= 1000U) {
+        oled_test_tick = now;
+        oled_test_white = !oled_test_white;
+        SSD1306_Fill(oled_test_white ? SSD1306_COLOR_WHITE : SSD1306_COLOR_BLACK);
+        oled_ready = SSD1306_UpdateScreen();
     }
-
-    // 显示更新任务
-    if (current_tick - last_display_update_tick >= DISPLAY_UPDATE_PERIOD_MS) {
-        last_display_update_tick = current_tick;
-
-        // 更新 OLED 显示
-        char buffer[32];
-
-        SSD1306_Clear();
-
-        // 显示标题
-        SSD1306_WriteString(0, 0, "Temp Control", SSD1306_COLOR_WHITE);
-
-        // 显示目标温度
-        snprintf(buffer, sizeof(buffer), "Target: %.1fC", TempControl_GetTarget());
-        SSD1306_WriteString(0, 16, buffer, SSD1306_COLOR_WHITE);
-
-        // 显示当前温度
-        snprintf(buffer, sizeof(buffer), "Current:%.1fC", TempControl_GetCurrent());
-        SSD1306_WriteString(0, 32, buffer, SSD1306_COLOR_WHITE);
-
-        // 显示系统状态
-        const char *state_str = "IDLE";
-        switch (TempControl_GetState()) {
-            case TEMP_CTRL_HEATING:
-                state_str = "HEATING";
-                break;
-            case TEMP_CTRL_COOLING:
-                state_str = "COOLING";
-                break;
-            case TEMP_CTRL_STABLE:
-                state_str = "STABLE";
-                break;
-            default:
-                state_str = "IDLE";
-                break;
-        }
-        snprintf(buffer, sizeof(buffer), "State: %s", state_str);
-        SSD1306_WriteString(0, 48, buffer, SSD1306_COLOR_WHITE);
-
-        SSD1306_UpdateScreen();
+#endif
+    if (!oled_ready && (uint32_t)(now - last_oled_retry_tick) >= 1000U) {
+        last_oled_retry_tick = now;
+        oled_ready = (I2C1_RecoverBus() == HAL_OK) && SSD1306_Init();
     }
-}
-
-/**
- * @brief  蓝牙接收回调函数
- * @param  data: 接收到的数据
- * @param  len: 数据长度
- */
-void SystemTask_BluetoothRxCallback(uint8_t *data, uint16_t len)
-{
-    char response[64];
-
-    // 解析命令
-    if (strncmp((char*)data, BT_CMD_SET_PREFIX, strlen(BT_CMD_SET_PREFIX)) == 0) {
-        // SET:XX.X 命令：设置目标温度
-        float new_target = atof((char*)data + strlen(BT_CMD_SET_PREFIX));
-
-        if (new_target >= TEMP_MIN && new_target <= TEMP_MAX) {
-            TempControl_SetTarget(new_target);
-            snprintf(response, sizeof(response), "OK: Target set to %.1f C\r\n", new_target);
-        } else {
-            snprintf(response, sizeof(response), "ERROR: Temp out of range (%.1f-%.1f)\r\n",
-                     TEMP_MIN, TEMP_MAX);
-        }
-
-        BSP_Bluetooth_TransmitString(response);
-
-    } else if (strncmp((char*)data, BT_CMD_GET, strlen(BT_CMD_GET)) == 0) {
-        // GET 命令：获取当前温度和目标温度
-        snprintf(response, sizeof(response), "Target:%.1f Current:%.1f\r\n",
-                 TempControl_GetTarget(), TempControl_GetCurrent());
-        BSP_Bluetooth_TransmitString(response);
-
-    } else {
-        // 未知命令
-        BSP_Bluetooth_TransmitString("ERROR: Unknown command\r\n");
-        BSP_Bluetooth_TransmitString("Usage: SET:XX.X or GET\r\n");
+#if !TEMP_OLED_INVERT_TEST
+    if (oled_ready && (uint32_t)(now - last_display_tick) >= DISPLAY_UPDATE_PERIOD_MS) {
+        last_display_tick = now;
+        display_temperature();
     }
+#endif
 }
